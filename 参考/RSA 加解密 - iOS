@@ -1,0 +1,623 @@
+
+# 一、首先了解一下几个相关概念，以方便后面遇到的问题的解决：
+
+RSA算法：1977年由Ron Rivest、Adi Shamirh和LenAdleman发明的，RSA就是取自他们三个人的名字。算法基于一个数论：将两个大素数相乘非常容易，但要对这个乘积的结果进行因式分解却非常困难，因此可以把乘积公开作为公钥。该算法能够抵抗目前已知的所有密码攻击。RSA算法是一种非对称算法，算法需要一对密钥，使用其中一个加密，需要使用另外一个才能解密。我们在进行RSA加密通讯时，就把公钥放在客户端，私钥留在服务器。
+DER, PEM：既然使用RSA需要一对密钥，那么我们当然是要先使用工具来生成这样一对密钥了。在linux、unix下，最简单方便的就是使用openssl命令行了。而DER、PEM就是生成的密钥可选择的两种文件格式。DER是Distinguished Encoding Rules的简称，是一种信息传输语法规则，在ITU X.690中定义的。在ios端，我们的公钥就是需要这样一种格式的，我们可以从Certificate, Key, and Trust Services Reference这篇文档的SecCertificateCreateWithData函数的data参数的说明中看到。而PEM格式是一种对DER进行封装的格式，他只是把der的内容进行了base64编码并加上了头尾说明。openssl命令行默认输出的都是PEM格式的文件，要能够在ios下使用，我们需要指定使用DER或者先生成PEM然后转换称DER。
+使用openssl命令行生成密钥对
+
+``` 
+openssl req -x509 -out public_key.der -outform der -new -newkey rsa:1024 -keyout private_key.pem
+```
+
+按照提示，填入私钥的密码，签名证书的组织名、邮件等信息之后，就会生成包含有公钥的证书文件public_key.der合私钥文件private_key.pem。public_key.der文件用于分发到ios客户端进行公钥加解密，而private_key.pem文件留在服务器端供php使用。当然，如果为了在服务器端进行加解密测试，那么我们还可以生成一个服务器端PHP使用的pem公钥文件：
+
+```
+openssl rsa -in private_key.pem -pubout -out public_key.pem
+```
+上面这个命令就会根据输入的私钥文件生成pem格式的公钥文件了。从这里也可以看到，根据私钥，我们是可以生成相对应的公钥的，这也就是为什么我们要把公钥放在客户端，而不是私钥放在客户端的原因了。
+
+
+
+# 二、关于加密的长度
+
+- key 长度为1024位， 1024/8 - 11 = 117, 所以一次加密内容不能超过117bytes。
+- key的长度为2048位，2048/8 - 11 = 245，一次加密内容不能超过245bytes。
+- 
+而分段加密代码中用128为单位分段，从而使得一个密钥报错，另一个不报错。
+
+# 三、使用 RSAEncryptor.h 类进行加解密
+
+### 1、iOS 项目中的秘钥加载需要用P12格式，下面说说生成步骤：
+- 生成证书请求文件rsaCertReq.csr
+```
+openssl req -new -key private_key.pem -out rsaCerReq.csr
+```
+注意：这一步会提示输入国家、省份、mail等信息，可以根据实际情况填写，或者全部不用填写，直接全部敲回车.
+
+- 生成证书rsaCert.crt，并设置有效时间为1年
+```
+openssl x509 -req -days 3650 -in rsaCerReq.csr -signkey private_key.pem -out rsaCert.crt
+```
+- 生成供iOS使用的私钥文件private_key.p12
+
+```
+openssl pkcs12 -export -out private_key.p12 -inkey private_key.pem -in rsaCert.crt
+```
+### 2、调用
+```
+    //原始数据
+    NSString *originalString = @"这是加密的内容_123_sdlajkdla";
+
+    //使用.der和.p12中的公钥私钥加密解密
+    NSString *public_key_path = [[NSBundle mainBundle] pathForResource:@"public_key.der" ofType:nil];
+    NSString *private_key_path = [[NSBundle mainBundle] pathForResource:@"private_key.p12" ofType:nil];
+    //
+    NSString *encryptStr = [RSAEncryptor encryptString:originalString publicKeyWithContentsOfFile:public_key_path];
+    NSLog(@"加密前:%@", originalString);
+    NSLog(@"加密后:%@", encryptStr);
+    NSLog(@"解密后:%@", [RSAEncryptor decryptString:encryptStr privateKeyWithContentsOfFile:private_key_path password:@"123456"]);
+
+```
+
+### 3、注意事项
+- 项目中需要添加`Security.framework`依赖库
+- Xcode 8 或以上版本 需要开启`Keychain Sharing` 开关
+- 放在项目中的.der  文件需要勾选`Target Membership`
+
+文章最后补充   RSAEncryptor.h 类
+
+## 四.扩展：
+### 1.为什么一次加密的数据长度为 （密钥长度／8-11） ？
+网上有说明文长度小于等于密钥长度（Bytes）-11，这说法本身不太准确，会给人感觉RSA 1024只能加密117字节长度明文。实际上，RSA算法本身要求加密内容也就是明文长度m必须0<m<n，也就是说内容这个大整数不能超过n，否则就出错。那么如果m=0是什么结果？普遍RSA加密器会直接返回全0结果。如果m>n，由于me ≡ c (mod n)，c为密文，m为明文，e和n组成公钥，显然当m>n时，m与m-n得出的密文一样，无法解密，运算就会出错。
+
+所以，RSA 1024实际可加密的明文长度最大也是1024bits，但问题就来了：
+
+如果小于这个长度怎么办？就需要进行padding，因为如果没有padding，用户无法确分解密后内容的真实长度，字符串之类的内容问题还不大，以0作为结束符，但对二进制数据就很难理解，因为不确定后面的0是内容还是内容结束符。
+
+只要用到padding，那么就要占用实际的明文长度，于是才有117字节的说法。我们一般使用的padding标准有NoPPadding、OAEPPadding、PKCS1Padding等，其中PKCS#1建议的padding就占用了11个字节。
+
+如果大于这个长度怎么办？很多算法的padding往往是在后边的，但PKCS的padding则是在前面的，此为有意设计，有意的把第一个字节置0以确保m的值小于n。
+
+这样，128字节（1024bits）-减去11字节正好是117字节，但对于RSA加密来讲，padding也是参与加密的，所以，依然按照1024bits去理解，但实际的明文只有117字节了。
+
+关于PKCS#1 padding规范可参考：RFC2313 chapter 8.1，我们在把明文送给RSA加密器前，要确认这个值是不是大于n，也就是如果接近n位长，那么需要先padding再分段加密。除非我们是“定长定量自己可控可理解”的加密不需要padding。
+为什么有不同长度的key？
+
+### 2.看一下密钥的生成过程：
+
+第一步，随机选择两个不相等的质数p和q。
+
+第二步，计算p和q的乘积n。n即密钥长度。
+
+第三步，计算n的欧拉函数φ(n)。
+
+第四步，随机选择一个整数e，条件是1< e < φ(n)，且e与φ(n) 互质。
+
+第五步，计算e对于φ(n)的模反元素d。
+
+第六步，将n和e封装成公钥，n和d封装成私钥。
+
+加密（c为密文，m为明文）：　　me ≡ c (mod n)
+
+解密（c为密文，m为明文）：　　cd ≡ m (mod n)
+
+对极大整数做因数分解（由n,e推出d）的难度决定了RSA算法的可靠性。换言之，对一极大整数做因数分解愈困难，RSA算法愈可靠。假如有人找到一种快速因数分解的算法，那么RSA的可靠性就会极度下降。但找到这样的算法的可能性是非常小的。今天只有短的RSA密钥才可能被暴力破解。只要密钥长度足够长，用RSA加密的信息实际上是不能被解破的。目前一般为1024 bit以上的密钥，推荐2048 bit以上。
+
+### 3. 对称加密vs分对称加密？
+
+对称加密是最快速、最简单的一种加密方式，加密（encryption）与解密（decryption）用的是同样的密钥（secret key）。对称加密有很多种算法，由于它效率很高，所以被广泛使用在很多加密协议的核心当中。对称加密通常使用的是相对较小的密钥，一般小于256 bit。因为密钥越大，加密越强，但加密与解密的过程越慢。密钥的大小既要照顾到安全性，也要照顾到效率，是一个trade-off。对称加密的一大缺点是密钥的管理与分配。
+
+非对称加密为数据的加密与解密提供了一个非常安全的方法，它使用了一对密钥，公钥（public key）和私钥（private key）。私钥只能由一方安全保管，不能外泄，而公钥则可以发给任何请求它的人。非对称加密使用这对密钥中的一个进行加密，而解密则需要另一个密钥。虽然非对称加密很安全，但是和对称加密比起来，它非常的慢。
+
+将两者结合起来，将对称加密的密钥使用非对称加密的公钥进行加密，然后发送出去，接收方使用私钥进行解密得到对称加密的密钥，然后双方可以使用对称加密来进行沟通。
+
+### 4.1 X509 文件扩展名
+首先我们要理解文件的扩展名代表什么。DER、PEM、CRT和CER这些扩展名经常令人困惑。很多人错误地认为这些扩展名可以互相代替。尽管的确有时候有些扩展名是可以互换的，但是最好你能确定证书是如何编码的，进而正确地标识它们。正确地标识证书有助于证书的管理。
+
+### 4.2 编码 (也用于扩展名)
+.DER = 扩展名DER用于二进制DER编码的证书。这些证书也可以用CER或者CRT作为扩展名。比较合适的说法是“我有一个DER编码的证书”，而不是“我有一个DER证书”。
+.PEM = 扩展名PEM用于ASCII(Base64)编码的各种X.509 v3 证书。文件开始由一行"—– BEGIN …“开始。
+
+### 4.3常用的扩展名
+ - .CRT = 扩展名CRT用于证书。证书可以是DER编码，也可以是PEM编码。扩展名CER和CRT几乎是同义词。这种情况在各种unix/linux系统中很常见。
+- CER = CRT证书的微软型式。可以用微软的工具把CRT文件转换为CER文件（CRT和CER必须是相同编码的，DER或者PEM）。扩展名为CER的文件可以被IE识别并作为命令调用微软的cryptoAPI（具体点就是rudll32.exe cryptext.dll, CyrptExtOpenCER），进而弹出一个对话框来导入并/或查看证书内容。
+- .KEY = 扩展名KEY用于PCSK#8的公钥和私钥。这些公钥和私钥可以是DER编码或者PEM编码。
+CRT文件和CER文件只有在使用相同编码的时候才可以安全地相互替代。
+
+
+
+==补充==
+### .h 文件
+```
+#import <Foundation/Foundation.h>
+
+@interface RSAEncryptor : NSObject
+/**
+ *  加密方法
+ *
+ *  @param str   需要加密的字符串
+ *  @param path  '.der'格式的公钥文件路径
+ */
++ (NSString *)encryptString:(NSString *)str publicKeyWithContentsOfFile:(NSString *)path;
+
+/**
+ *  解密方法
+ *
+ *  @param str       需要解密的字符串
+ *  @param path      '.p12'格式的私钥文件路径
+ *  @param password  私钥文件密码
+ */
++ (NSString *)decryptString:(NSString *)str privateKeyWithContentsOfFile:(NSString *)path password:(NSString *)password;
+
+/**
+ *  加密方法
+ *
+ *  @param str    需要加密的字符串
+ *  @param pubKey 公钥字符串
+ */
++ (NSString *)encryptString:(NSString *)str publicKey:(NSString *)pubKey;
+
+/**
+ *  解密方法
+ *
+ *  @param str     需要解密的字符串
+ *  @param privKey 私钥字符串
+ */
++ (NSString *)decryptString:(NSString *)str privateKey:(NSString *)privKey;
+@end
+
+```
+
+ ### .m 文件
+ 
+```
+
+#import "RSAEncryptor.h"
+#import <Security/Security.h>
+@implementation RSAEncryptor
+static NSString *base64_encode_data(NSData *data){
+    data = [data base64EncodedDataWithOptions:0];
+    NSString *ret = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return ret;
+}
+
+static NSData *base64_decode(NSString *str){
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:str options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    return data;
+}
+
+#pragma mark - 使用'.der'公钥文件加密
+
+//加密
++ (NSString *)encryptString:(NSString *)str publicKeyWithContentsOfFile:(NSString *)path{
+    if (!str || !path)  return nil;
+    return [self encryptString:str publicKeyRef:[self getPublicKeyRefWithContentsOfFile:path]];
+}
+
+//获取公钥
++ (SecKeyRef)getPublicKeyRefWithContentsOfFile:(NSString *)filePath{
+    NSData *certData = [NSData dataWithContentsOfFile:filePath];
+    if (!certData) {
+        return nil;
+    }
+    SecCertificateRef cert = SecCertificateCreateWithData(NULL, (CFDataRef)certData);
+    SecKeyRef key = NULL;
+    SecTrustRef trust = NULL;
+    SecPolicyRef policy = NULL;
+    if (cert != NULL) {
+        policy = SecPolicyCreateBasicX509();
+        if (policy) {
+            if (SecTrustCreateWithCertificates((CFTypeRef)cert, policy, &trust) == noErr) {
+                SecTrustResultType result;
+                if (SecTrustEvaluate(trust, &result) == noErr) {
+                    key = SecTrustCopyPublicKey(trust);
+                }
+            }
+        }
+    }
+    if (policy) CFRelease(policy);
+    if (trust) CFRelease(trust);
+    if (cert) CFRelease(cert);
+    return key;
+}
+
++ (NSString *)encryptString:(NSString *)str publicKeyRef:(SecKeyRef)publicKeyRef{
+    if(![str dataUsingEncoding:NSUTF8StringEncoding]){
+        return nil;
+    }
+    if(!publicKeyRef){
+        return nil;
+    }
+    NSData *data = [self encryptData:[str dataUsingEncoding:NSUTF8StringEncoding] withKeyRef:publicKeyRef];
+    NSString *ret = base64_encode_data(data);
+    return ret;
+}
+
+#pragma mark - 使用'.12'私钥文件解密
+
+//解密
++ (NSString *)decryptString:(NSString *)str privateKeyWithContentsOfFile:(NSString *)path password:(NSString *)password{
+    if (!str || !path) return nil;
+    if (!password) password = @"";
+    return [self decryptString:str privateKeyRef:[self getPrivateKeyRefWithContentsOfFile:path password:password]];
+}
+//获取私钥
++ (SecKeyRef)getPrivateKeyRefWithContentsOfFile:(NSString *)filePath password:(NSString*)password{
+    
+    NSData *p12Data = [NSData dataWithContentsOfFile:filePath];
+    if (!p12Data) {
+        return nil;
+    }
+    SecKeyRef privateKeyRef = NULL;
+    NSMutableDictionary * options = [[NSMutableDictionary alloc] init];
+    [options setObject: password forKey:(__bridge id)kSecImportExportPassphrase];
+    CFArrayRef items = CFArrayCreate(NULL, 0, 0, NULL);
+    OSStatus securityError = SecPKCS12Import((__bridge CFDataRef) p12Data, (__bridge CFDictionaryRef)options, &items);
+    if (securityError == noErr && CFArrayGetCount(items) > 0) {
+        CFDictionaryRef identityDict = CFArrayGetValueAtIndex(items, 0);
+        SecIdentityRef identityApp = (SecIdentityRef)CFDictionaryGetValue(identityDict, kSecImportItemIdentity);
+        securityError = SecIdentityCopyPrivateKey(identityApp, &privateKeyRef);
+        if (securityError != noErr) {
+            privateKeyRef = NULL;
+        }
+    }
+    CFRelease(items);
+    
+    return privateKeyRef;
+}
+
++ (NSString *)decryptString:(NSString *)str privateKeyRef:(SecKeyRef)privKeyRef{
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:str options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    if (!privKeyRef) {
+        return nil;
+    }
+    data = [self decryptData:data withKeyRef:privKeyRef];
+    NSString *ret = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return ret;
+}
+
+#pragma mark - 使用公钥字符串加密
+
+/* START: Encryption with RSA public key */
+
+//使用公钥字符串加密
++ (NSString *)encryptString:(NSString *)str publicKey:(NSString *)pubKey{
+    NSData *data = [self encryptData:[str dataUsingEncoding:NSUTF8StringEncoding] publicKey:pubKey];
+    NSString *ret = base64_encode_data(data);
+    return ret;
+}
+
++ (NSData *)encryptData:(NSData *)data publicKey:(NSString *)pubKey{
+    if(!data || !pubKey){
+        return nil;
+    }
+    SecKeyRef keyRef = [self addPublicKey:pubKey];
+    if(!keyRef){
+        return nil;
+    }
+    return [self encryptData:data withKeyRef:keyRef];
+}
+
++ (SecKeyRef)addPublicKey:(NSString *)key{
+    NSRange spos = [key rangeOfString:@"-----BEGIN PUBLIC KEY-----"];
+    NSRange epos = [key rangeOfString:@"-----END PUBLIC KEY-----"];
+    if(spos.location != NSNotFound && epos.location != NSNotFound){
+        NSUInteger s = spos.location + spos.length;
+        NSUInteger e = epos.location;
+        NSRange range = NSMakeRange(s, e-s);
+        key = [key substringWithRange:range];
+    }
+    key = [key stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+    key = [key stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+    key = [key stringByReplacingOccurrencesOfString:@"\t" withString:@""];
+    key = [key stringByReplacingOccurrencesOfString:@" "  withString:@""];
+    
+    // This will be base64 encoded, decode it.
+    NSData *data = base64_decode(key);
+    data = [self stripPublicKeyHeader:data];
+    if(!data){
+        return nil;
+    }
+    
+    //a tag to read/write keychain storage
+    NSString *tag = @"RSAUtil_PubKey";
+    NSData *d_tag = [NSData dataWithBytes:[tag UTF8String] length:[tag length]];
+    
+    // Delete any old lingering key with the same tag
+    NSMutableDictionary *publicKey = [[NSMutableDictionary alloc] init];
+    [publicKey setObject:(__bridge id) kSecClassKey forKey:(__bridge id)kSecClass];
+    [publicKey setObject:(__bridge id) kSecAttrKeyTypeRSA forKey:(__bridge id)kSecAttrKeyType];
+    [publicKey setObject:d_tag forKey:(__bridge id)kSecAttrApplicationTag];
+    SecItemDelete((__bridge CFDictionaryRef)publicKey);
+    
+    // Add persistent version of the key to system keychain
+    [publicKey setObject:data forKey:(__bridge id)kSecValueData];
+    [publicKey setObject:(__bridge id) kSecAttrKeyClassPublic forKey:(__bridge id)
+     kSecAttrKeyClass];
+    [publicKey setObject:[NSNumber numberWithBool:YES] forKey:(__bridge id)
+     kSecReturnPersistentRef];
+    
+    CFTypeRef persistKey = nil;
+    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)publicKey, &persistKey);
+    if (persistKey != nil){
+        CFRelease(persistKey);
+    }
+    if ((status != noErr) && (status != errSecDuplicateItem)) {
+        return nil;
+    }
+    
+    [publicKey removeObjectForKey:(__bridge id)kSecValueData];
+    [publicKey removeObjectForKey:(__bridge id)kSecReturnPersistentRef];
+    [publicKey setObject:[NSNumber numberWithBool:YES] forKey:(__bridge id)kSecReturnRef];
+    [publicKey setObject:(__bridge id) kSecAttrKeyTypeRSA forKey:(__bridge id)kSecAttrKeyType];
+    
+    // Now fetch the SecKeyRef version of the key
+    SecKeyRef keyRef = nil;
+    status = SecItemCopyMatching((__bridge CFDictionaryRef)publicKey, (CFTypeRef *)&keyRef);
+    if(status != noErr){
+        return nil;
+    }
+    return keyRef;
+}
+
++ (NSData *)stripPublicKeyHeader:(NSData *)d_key{
+    // Skip ASN.1 public key header
+    if (d_key == nil) return(nil);
+    
+    unsigned long len = [d_key length];
+    if (!len) return(nil);
+    
+    unsigned char *c_key = (unsigned char *)[d_key bytes];
+    unsigned int  idx     = 0;
+    
+    if (c_key[idx++] != 0x30) return(nil);
+    
+    if (c_key[idx] > 0x80) idx += c_key[idx] - 0x80 + 1;
+    else idx++;
+    
+    // PKCS #1 rsaEncryption szOID_RSA_RSA
+    static unsigned char seqiod[] =
+    { 0x30,   0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, 0x05, 0x00 };
+    if (memcmp(&c_key[idx], seqiod, 15)) return(nil);
+    
+    idx += 15;
+    
+    if (c_key[idx++] != 0x03) return(nil);
+    
+    if (c_key[idx] > 0x80) idx += c_key[idx] - 0x80 + 1;
+    else idx++;
+    
+    if (c_key[idx++] != '\0') return(nil);
+    
+    // Now make a new NSData from this buffer
+    return ([NSData dataWithBytes:&c_key[idx] length:len - idx]);
+}
+
++ (NSData *)encryptData:(NSData *)data withKeyRef:(SecKeyRef) keyRef{
+    const uint8_t *srcbuf = (const uint8_t *)[data bytes];
+    size_t srclen = (size_t)data.length;
+    
+    size_t block_size = SecKeyGetBlockSize(keyRef) * sizeof(uint8_t);
+    void *outbuf = malloc(block_size);
+    size_t src_block_size = block_size - 11;
+    
+    NSMutableData *ret = [[NSMutableData alloc] init];
+    for(int idx=0; idx<srclen; idx+=src_block_size){
+        //NSLog(@"%d/%d block_size: %d", idx, (int)srclen, (int)block_size);
+        size_t data_len = srclen - idx;
+        if(data_len > src_block_size){
+            data_len = src_block_size;
+        }
+        
+        size_t outlen = block_size;
+        OSStatus status = noErr;
+        status = SecKeyEncrypt(keyRef,
+                               kSecPaddingPKCS1,
+                               srcbuf + idx,
+                               data_len,
+                               outbuf,
+                               &outlen
+                               );
+        if (status != 0) {
+            NSLog(@"SecKeyEncrypt fail. Error Code: %d", status);
+            ret = nil;
+            break;
+        }else{
+            [ret appendBytes:outbuf length:outlen];
+        }
+    }
+    
+    free(outbuf);
+    CFRelease(keyRef);
+    return ret;
+}
+
+/* END: Encryption with RSA public key */
+
+#pragma mark - 使用私钥字符串解密
+
+/* START: Decryption with RSA private key */
+
+//使用私钥字符串解密
++ (NSString *)decryptString:(NSString *)str privateKey:(NSString *)privKey{
+    if (!str) return nil;
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:str options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    data = [self decryptData:data privateKey:privKey];
+    NSString *ret = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return ret;
+}
+
++ (NSData *)decryptData:(NSData *)data privateKey:(NSString *)privKey{
+    if(!data || !privKey){
+        return nil;
+    }
+    SecKeyRef keyRef = [self addPrivateKey:privKey];
+    if(!keyRef){
+        return nil;
+    }
+    return [self decryptData:data withKeyRef:keyRef];
+}
+
++ (SecKeyRef)addPrivateKey:(NSString *)key{
+    NSRange spos = [key rangeOfString:@"-----BEGIN RSA PRIVATE KEY-----"];
+    NSRange epos = [key rangeOfString:@"-----END RSA PRIVATE KEY-----"];
+    if(spos.location != NSNotFound && epos.location != NSNotFound){
+        NSUInteger s = spos.location + spos.length;
+        NSUInteger e = epos.location;
+        NSRange range = NSMakeRange(s, e-s);
+        key = [key substringWithRange:range];
+    }
+    key = [key stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+    key = [key stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+    key = [key stringByReplacingOccurrencesOfString:@"\t" withString:@""];
+    key = [key stringByReplacingOccurrencesOfString:@" "  withString:@""];
+    
+    // This will be base64 encoded, decode it.
+    NSData *data = base64_decode(key);
+    data = [self stripPrivateKeyHeader:data];
+    if(!data){
+        return nil;
+    }
+    
+    //a tag to read/write keychain storage
+    NSString *tag = @"RSAUtil_PrivKey";
+    NSData *d_tag = [NSData dataWithBytes:[tag UTF8String] length:[tag length]];
+    
+    // Delete any old lingering key with the same tag
+    NSMutableDictionary *privateKey = [[NSMutableDictionary alloc] init];
+    [privateKey setObject:(__bridge id) kSecClassKey forKey:(__bridge id)kSecClass];
+    [privateKey setObject:(__bridge id) kSecAttrKeyTypeRSA forKey:(__bridge id)kSecAttrKeyType];
+    [privateKey setObject:d_tag forKey:(__bridge id)kSecAttrApplicationTag];
+    SecItemDelete((__bridge CFDictionaryRef)privateKey);
+    
+    // Add persistent version of the key to system keychain
+    [privateKey setObject:data forKey:(__bridge id)kSecValueData];
+    [privateKey setObject:(__bridge id) kSecAttrKeyClassPrivate forKey:(__bridge id)
+     kSecAttrKeyClass];
+    [privateKey setObject:[NSNumber numberWithBool:YES] forKey:(__bridge id)
+     kSecReturnPersistentRef];
+    
+    CFTypeRef persistKey = nil;
+    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)privateKey, &persistKey);
+    if (persistKey != nil){
+        CFRelease(persistKey);
+    }
+    if ((status != noErr) && (status != errSecDuplicateItem)) {
+        return nil;
+    }
+    
+    [privateKey removeObjectForKey:(__bridge id)kSecValueData];
+    [privateKey removeObjectForKey:(__bridge id)kSecReturnPersistentRef];
+    [privateKey setObject:[NSNumber numberWithBool:YES] forKey:(__bridge id)kSecReturnRef];
+    [privateKey setObject:(__bridge id) kSecAttrKeyTypeRSA forKey:(__bridge id)kSecAttrKeyType];
+    
+    // Now fetch the SecKeyRef version of the key
+    SecKeyRef keyRef = nil;
+    status = SecItemCopyMatching((__bridge CFDictionaryRef)privateKey, (CFTypeRef *)&keyRef);
+    if(status != noErr){
+        return nil;
+    }
+    return keyRef;
+}
+
++ (NSData *)stripPrivateKeyHeader:(NSData *)d_key{
+    // Skip ASN.1 private key header
+    if (d_key == nil) return(nil);
+    
+    unsigned long len = [d_key length];
+    if (!len) return(nil);
+    
+    unsigned char *c_key = (unsigned char *)[d_key bytes];
+    unsigned int  idx     = 22; //magic byte at offset 22
+    
+    if (0x04 != c_key[idx++]) return nil;
+    
+    //calculate length of the key
+    unsigned int c_len = c_key[idx++];
+    int det = c_len & 0x80;
+    if (!det) {
+        c_len = c_len & 0x7f;
+    } else {
+        int byteCount = c_len & 0x7f;
+        if (byteCount + idx > len) {
+            //rsa length field longer than buffer
+            return nil;
+        }
+        unsigned int accum = 0;
+        unsigned char *ptr = &c_key[idx];
+        idx += byteCount;
+        while (byteCount) {
+            accum = (accum << 8) + *ptr;
+            ptr++;
+            byteCount--;
+        }
+        c_len = accum;
+    }
+    
+    // Now make a new NSData from this buffer
+    return [d_key subdataWithRange:NSMakeRange(idx, c_len)];
+}
+
++ (NSData *)decryptData:(NSData *)data withKeyRef:(SecKeyRef) keyRef{
+    const uint8_t *srcbuf = (const uint8_t *)[data bytes];
+    size_t srclen = (size_t)data.length;
+    
+    size_t block_size = SecKeyGetBlockSize(keyRef) * sizeof(uint8_t);
+    UInt8 *outbuf = malloc(block_size);
+    size_t src_block_size = block_size;
+    
+    NSMutableData *ret = [[NSMutableData alloc] init];
+    for(int idx=0; idx<srclen; idx+=src_block_size){
+        //NSLog(@"%d/%d block_size: %d", idx, (int)srclen, (int)block_size);
+        size_t data_len = srclen - idx;
+        if(data_len > src_block_size){
+            data_len = src_block_size;
+        }
+        
+        size_t outlen = block_size;
+        OSStatus status = noErr;
+        status = SecKeyDecrypt(keyRef,
+                               kSecPaddingNone,
+                               srcbuf + idx,
+                               data_len,
+                               outbuf,
+                               &outlen
+                               );
+        if (status != 0) {
+            NSLog(@"SecKeyEncrypt fail. Error Code: %d", status);
+            ret = nil;
+            break;
+        }else{
+            //the actual decrypted data is in the middle, locate it!
+            int idxFirstZero = -1;
+            int idxNextZero = (int)outlen;
+            for ( int i = 0; i < outlen; i++ ) {
+                if ( outbuf[i] == 0 ) {
+                    if ( idxFirstZero < 0 ) {
+                        idxFirstZero = i;
+                    } else {
+                        idxNextZero = i;
+                        break;
+                    }
+                }
+            }
+            
+            [ret appendBytes:&outbuf[idxFirstZero+1] length:idxNextZero-idxFirstZero-1];
+        }
+    }
+    
+    free(outbuf);
+    CFRelease(keyRef);
+    return ret;
+}
+@end
+```
+
+
+【摘录】
+
+http://blog.csdn.net/taoxin52/article/details/53782470
+http://blog.sina.com.cn/s/blog_a9303fd90101jmtx.html
+http://blog.sina.com.cn/s/blog_67d955460101loi3.html
+http://www.jianshu.com/p/74a796ec5038
